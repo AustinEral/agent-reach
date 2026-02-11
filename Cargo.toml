@@ -1,0 +1,32 @@
+[package]
+name = "agent-reach"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "DID-based discovery registry for AI agents"
+repository = "https://github.com/AustinEral/agent-reach"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto / identity
+agent-id = { git = "https://github.com/AustinEral/agent-id.git" }
+
+# Utilities
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.21"
+parking_lot = "0.12"
+urlencoding = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["json"] }
