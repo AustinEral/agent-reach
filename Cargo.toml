@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Crypto / identity
-agent-id = { git = "https://github.com/AustinEral/agent-id.git" }
+agent-id = "0.1"
 
 # Utilities
 thiserror = "1"
