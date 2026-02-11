@@ -1,17 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-/// Registration request
+/// Registration request (authenticated by session)
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
-    /// The agent's DID (did:key:...)
-    pub did: String,
     /// Where to reach this agent (any URI format)
     pub endpoint: String,
     /// Time-to-live in seconds (default: 3600)
     #[serde(default = "default_ttl")]
     pub ttl: u64,
-    /// Signature of the registration payload
-    pub signature: String,
 }
 
 fn default_ttl() -> u64 {
@@ -34,13 +30,6 @@ pub struct LookupResponse {
     pub status: AgentStatus,
     pub registered_at: i64,
     pub expires_at: i64,
-}
-
-/// Deregistration request
-#[derive(Debug, Deserialize)]
-pub struct DeregisterRequest {
-    pub did: String,
-    pub signature: String,
 }
 
 /// Deregistration response

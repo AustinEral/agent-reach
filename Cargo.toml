@@ -18,7 +18,9 @@ serde_json = "1"
 
 # Crypto / identity
 agent-id = "0.1"
+agent-id-handshake = "0.1"
 ed25519-dalek = "2"
+uuid = { version = "1", features = ["v4"] }
 
 # Utilities
 thiserror = "1"
