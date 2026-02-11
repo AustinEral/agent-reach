@@ -117,7 +117,7 @@ impl ReachMcpServer {
             .await
             .map_err(|e| format!("Failed to send Hello: {}", e))?;
 
-        if !resp.status().is_success() {
+        let status = resp.status(); if !status.is_success() { tracing::error!("Deregister failed with status: {}", status);
             let error = resp.text().await.unwrap_or_default();
             return Err(format!("Hello failed: {}", error));
         }
@@ -139,7 +139,7 @@ impl ReachMcpServer {
             .await
             .map_err(|e| format!("Failed to send Proof: {}", e))?;
 
-        if !resp.status().is_success() {
+        let status = resp.status(); if !status.is_success() { tracing::error!("Deregister failed with status: {}", status);
             let error = resp.text().await.unwrap_or_default();
             return Err(format!("Proof failed: {}", error));
         }
@@ -172,7 +172,7 @@ impl ReachMcpServer {
             .await
             .map_err(|e| format!("Failed to send register: {}", e))?;
 
-        if !resp.status().is_success() {
+        let status = resp.status(); if !status.is_success() { tracing::error!("Deregister failed with status: {}", status);
             let error: ErrorResponse = resp.json().await
                 .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
             return Err(error.error);
@@ -197,7 +197,7 @@ impl ReachMcpServer {
             return Err("Agent not found in registry".to_string());
         }
 
-        if !resp.status().is_success() {
+        let status = resp.status(); if !status.is_success() { tracing::error!("Deregister failed with status: {}", status);
             let error: ErrorResponse = resp.json().await
                 .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
             return Err(error.error);
@@ -213,13 +213,13 @@ impl ReachMcpServer {
         let session_id = self.authenticate().await?;
 
         let resp = self.client
-            .delete(format!("{}/deregister", self.registry_url))
+            .post(format!("{}/deregister", self.registry_url))
             .header("Authorization", format!("Bearer {}", session_id))
             .send()
             .await
             .map_err(|e| format!("Failed to deregister: {}", e))?;
 
-        if !resp.status().is_success() {
+        let status = resp.status(); if !status.is_success() { tracing::error!("Deregister failed with status: {}", status);
             let error: ErrorResponse = resp.json().await
                 .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
             return Err(error.error);
