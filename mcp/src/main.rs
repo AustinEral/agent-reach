@@ -1,40 +1,49 @@
 //! agent-reach-mcp: MCP server for agent-reach discovery registry
-//!
-//! Provides tools for agents to register, lookup, and manage their
-//! presence in the agent-reach discovery registry.
 
+use std::sync::Arc;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rmcp::{
-    ServerHandler, ServiceExt,
-    model::{ServerCapabilities, ServerInfo, Implementation},
-    schemars, tool,
+    Error as McpError, ServiceExt,
+    model::{
+        ServerCapabilities, Implementation, ServerInfo, Tool, CallToolResult,
+        Content, ListToolsResult, CallToolRequestParam, PaginatedRequestParam,
+        ToolsCapability,
+    },
+    handler::server::ServerHandler,
+    service::{RequestContext, RoleServer},
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, error};
+use tracing::info;
 
 use agent_id::RootKey;
-use agent_id_handshake::protocol::Prover;
+use agent_id_handshake::{
+    messages::{Hello, Challenge, ProofAccepted},
+    protocol::sign_proof,
+};
 
 /// Default registry URL
 const DEFAULT_REGISTRY_URL: &str = "https://reach.agent-id.ai";
 
+/// Stored identity format (matches agent-id-mcp)
+#[derive(Serialize, Deserialize)]
+struct StoredIdentity {
+    version: u32,
+    did: String,
+    private_key: String,
+    created: String,
+}
+
 /// Identity file location (same as agent-id-mcp)
 fn identity_path() -> PathBuf {
     directories::ProjectDirs::from("ai", "agent-id", "agent-id")
-        .map(|dirs| dirs.config_dir().join("identity.json"))
-        .unwrap_or_else(|| PathBuf::from("~/.config/agent-id/identity.json"))
-}
-
-/// Stored identity format
-#[derive(Serialize, Deserialize)]
-struct StoredIdentity {
-    secret_key: String,
+        .map(|dirs| dirs.data_dir().join("identity.json"))
+        .unwrap_or_else(|| PathBuf::from("~/.agent-id/identity.json"))
 }
 
 /// Load identity from disk
@@ -44,131 +53,23 @@ fn load_identity() -> Result<RootKey> {
         .with_context(|| format!("Failed to read identity from {:?}", path))?;
     let stored: StoredIdentity = serde_json::from_str(&content)
         .context("Failed to parse identity file")?;
-    let key = RootKey::from_secret_key_base64(&stored.secret_key)
-        .context("Failed to load key from secret")?;
+    
+    let key_bytes = BASE64.decode(&stored.private_key)
+        .context("Failed to decode private key")?;
+    let key_array: [u8; 32] = key_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid private key length"))?;
+    let key = RootKey::from_bytes(&key_array)
+        .context("Failed to create key from bytes")?;
     Ok(key)
 }
 
 /// MCP Server state
-struct ReachMcpServer {
-    /// Agent's identity
-    key: RootKey,
-    /// HTTP client
-    client: reqwest::Client,
-    /// Registry URL
-    registry_url: String,
-    /// Current session (after successful auth)
-    session: RwLock<Option<AuthSession>>,
-}
-
 #[derive(Clone)]
-struct AuthSession {
-    session_id: String,
-    #[allow(dead_code)]
-    did: String,
-}
-
-impl ReachMcpServer {
-    fn new(key: RootKey) -> Self {
-        Self {
-            key,
-            client: reqwest::Client::new(),
-            registry_url: std::env::var("REACH_REGISTRY_URL")
-                .unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string()),
-            session: RwLock::new(None),
-        }
-    }
-
-    /// Perform handshake authentication, returns session_id
-    async fn authenticate(&self) -> Result<String> {
-        // Check if we have a valid session
-        if let Some(session) = self.session.read().await.as_ref() {
-            return Ok(session.session_id.clone());
-        }
-
-        info!("Authenticating with registry...");
-
-        // Step 1: Send Hello
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as i64;
-
-        let hello = serde_json::json!({
-            "type": "hello",
-            "version": "1.0",
-            "did": self.key.did().to_string(),
-            "protocols": [],
-            "timestamp": timestamp
-        });
-
-        let resp = self.client
-            .post(format!("{}/hello", self.registry_url))
-            .json(&hello)
-            .send()
-            .await
-            .context("Failed to send Hello")?;
-
-        if !resp.status().is_success() {
-            let error = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hello failed: {}", error);
-        }
-
-        let challenge: ChallengeResponse = resp.json().await
-            .context("Failed to parse Challenge")?;
-
-        info!("Received challenge, signing proof...");
-
-        // Step 2: Create and send Proof
-        // Convert our challenge response to the format Prover expects
-        let handshake_challenge = agent_id_handshake::Challenge {
-            msg_type: challenge.r#type.clone(),
-            version: challenge.version.clone(),
-            nonce: challenge.nonce.clone(),
-            timestamp: challenge.timestamp,
-            audience: challenge.audience.clone(),
-            issuer: challenge.issuer.clone(),
-        };
-
-        let prover = Prover::new(self.key.clone());
-        let proof = prover.create_proof(&handshake_challenge)
-            .context("Failed to create proof")?;
-
-        let resp = self.client
-            .post(format!("{}/proof", self.registry_url))
-            .json(&proof)
-            .send()
-            .await
-            .context("Failed to send Proof")?;
-
-        if !resp.status().is_success() {
-            let error = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Proof failed: {}", error);
-        }
-
-        let accepted: ProofAcceptedResponse = resp.json().await
-            .context("Failed to parse ProofAccepted")?;
-
-        info!("Authentication successful");
-
-        // Store session
-        let session = AuthSession {
-            session_id: accepted.session_id.clone(),
-            did: self.key.did().to_string(),
-        };
-        *self.session.write().await = Some(session);
-
-        Ok(accepted.session_id)
-    }
-}
-
-#[derive(Deserialize)]
-struct ChallengeResponse {
-    r#type: String,
-    version: String,
-    nonce: String,
-    timestamp: i64,
-    audience: String,
-    issuer: String,
+struct ReachMcpServer {
+    key: Arc<RootKey>,
+    client: reqwest::Client,
+    registry_url: String,
+    session: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -187,217 +88,306 @@ struct ErrorResponse {
     error: String,
 }
 
-// ============================================================================
-// MCP Tool Handlers
-// ============================================================================
-
-#[tool(
-    name = "reach_register",
-    description = "Register your agent's endpoint in the discovery registry. Other agents will be able to find you at this endpoint."
-)]
-async fn reach_register(
-    #[doc = "The endpoint URL where your agent can be reached (e.g., https://example.com/agent/inbox)"]
-    endpoint: String,
-    #[tool(aggr)] server: Arc<ReachMcpServer>,
-) -> String {
-    match register_impl(&server, &endpoint).await {
-        Ok(()) => format!("✓ Registered {} at endpoint: {}", server.key.did(), endpoint),
-        Err(e) => format!("✗ Registration failed: {}", e),
-    }
-}
-
-async fn register_impl(server: &ReachMcpServer, endpoint: &str) -> Result<()> {
-    let session_id = server.authenticate().await?;
-
-    #[derive(Serialize)]
-    struct RegisterRequest {
-        endpoint: String,
-    }
-
-    let resp = server.client
-        .post(format!("{}/register", server.registry_url))
-        .header("Authorization", format!("Bearer {}", session_id))
-        .json(&RegisterRequest { endpoint: endpoint.to_string() })
-        .send()
-        .await
-        .context("Failed to send register request")?;
-
-    if !resp.status().is_success() {
-        let error: ErrorResponse = resp.json().await
-            .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
-        anyhow::bail!("{}", error.error);
-    }
-
-    Ok(())
-}
-
-#[tool(
-    name = "reach_lookup",
-    description = "Look up another agent's endpoint by their DID. Returns the endpoint URL where they can be reached."
-)]
-async fn reach_lookup(
-    #[doc = "The DID of the agent to look up (e.g., did:key:z6Mk...)"]
-    did: String,
-    #[tool(aggr)] server: Arc<ReachMcpServer>,
-) -> String {
-    match lookup_impl(&server, &did).await {
-        Ok(endpoint) => format!("✓ Found {}\n  Endpoint: {}", did, endpoint),
-        Err(e) => format!("✗ Lookup failed: {}", e),
-    }
-}
-
-async fn lookup_impl(server: &ReachMcpServer, did: &str) -> Result<String> {
-    let encoded_did = urlencoding::encode(did);
-    let resp = server.client
-        .get(format!("{}/lookup/{}", server.registry_url, encoded_did))
-        .send()
-        .await
-        .context("Failed to send lookup request")?;
-
-    if resp.status().as_u16() == 404 {
-        anyhow::bail!("Agent not found in registry");
-    }
-
-    if !resp.status().is_success() {
-        let error: ErrorResponse = resp.json().await
-            .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
-        anyhow::bail!("{}", error.error);
-    }
-
-    let lookup: LookupResponse = resp.json().await
-        .context("Failed to parse lookup response")?;
-
-    Ok(lookup.endpoint)
-}
-
-#[tool(
-    name = "reach_deregister",
-    description = "Remove your agent's registration from the discovery registry. Other agents will no longer be able to find you."
-)]
-async fn reach_deregister(
-    #[tool(aggr)] server: Arc<ReachMcpServer>,
-) -> String {
-    match deregister_impl(&server).await {
-        Ok(()) => format!("✓ Deregistered {}", server.key.did()),
-        Err(e) => format!("✗ Deregistration failed: {}", e),
-    }
-}
-
-async fn deregister_impl(server: &ReachMcpServer) -> Result<()> {
-    let session_id = server.authenticate().await?;
-
-    let resp = server.client
-        .delete(format!("{}/deregister", server.registry_url))
-        .header("Authorization", format!("Bearer {}", session_id))
-        .send()
-        .await
-        .context("Failed to send deregister request")?;
-
-    if !resp.status().is_success() {
-        let error: ErrorResponse = resp.json().await
-            .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
-        anyhow::bail!("{}", error.error);
-    }
-
-    // Clear session
-    *server.session.write().await = None;
-
-    Ok(())
-}
-
-#[tool(
-    name = "reach_status",
-    description = "Check your current registration status in the discovery registry."
-)]
-async fn reach_status(
-    #[tool(aggr)] server: Arc<ReachMcpServer>,
-) -> String {
-    let did = server.key.did().to_string();
-    
-    match lookup_impl(&server, &did).await {
-        Ok(endpoint) => format!("✓ Registered\n  DID: {}\n  Endpoint: {}", did, endpoint),
-        Err(_) => format!("○ Not registered\n  DID: {}", did),
-    }
-}
-
-#[tool(
-    name = "reach_whoami",
-    description = "Show your agent's DID (decentralized identifier) used for the registry."
-)]
-async fn reach_whoami(
-    #[tool(aggr)] server: Arc<ReachMcpServer>,
-) -> String {
-    format!("Your DID: {}", server.key.did())
-}
-
-// ============================================================================
-// MCP Server Implementation
-// ============================================================================
-
-#[derive(Clone)]
-struct ReachMcpHandler {
-    server: Arc<ReachMcpServer>,
-}
-
-impl ServerHandler for ReachMcpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            name: "agent-reach-mcp".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            instructions: Some(
-                "MCP server for agent-reach discovery registry. \
-                 Allows agents to register their endpoints, look up other agents, \
-                 and manage their presence in the registry.".to_string()
-            ),
-            ..Default::default()
+impl ReachMcpServer {
+    fn new(key: RootKey) -> Self {
+        Self {
+            key: Arc::new(key),
+            client: reqwest::Client::new(),
+            registry_url: std::env::var("REACH_REGISTRY_URL")
+                .unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string()),
+            session: Arc::new(RwLock::new(None)),
         }
     }
 
-    fn get_capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities {
-            tools: Some(rmcp::model::ToolsCapability::default()),
-            ..Default::default()
+    async fn authenticate(&self) -> Result<String, String> {
+        // Check existing session
+        if let Some(ref session_id) = *self.session.read().await {
+            return Ok(session_id.clone());
+        }
+
+        info!("Authenticating with registry...");
+
+        // Step 1: Send Hello
+        let hello = Hello::new(self.key.did().to_string());
+
+        let resp = self.client
+            .post(format!("{}/hello", self.registry_url))
+            .json(&hello)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send Hello: {}", e))?;
+
+        if !resp.status().is_success() {
+            let error = resp.text().await.unwrap_or_default();
+            return Err(format!("Hello failed: {}", error));
+        }
+
+        let challenge: Challenge = resp.json().await
+            .map_err(|e| format!("Failed to parse Challenge: {}", e))?;
+
+        info!("Received challenge, signing proof...");
+
+        // Step 2: Create and send Proof
+        let my_did = self.key.did();
+        let proof = sign_proof(&challenge, &my_did, &self.key, None)
+            .map_err(|e| format!("Failed to create proof: {}", e))?;
+
+        let resp = self.client
+            .post(format!("{}/proof", self.registry_url))
+            .json(&proof)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send Proof: {}", e))?;
+
+        if !resp.status().is_success() {
+            let error = resp.text().await.unwrap_or_default();
+            return Err(format!("Proof failed: {}", error));
+        }
+
+        let accepted: ProofAcceptedResponse = resp.json().await
+            .map_err(|e| format!("Failed to parse ProofAccepted: {}", e))?;
+
+        info!("Authentication successful");
+
+        *self.session.write().await = Some(accepted.session_id.clone());
+
+        Ok(accepted.session_id)
+    }
+
+    async fn handle_register(&self, args: serde_json::Map<String, serde_json::Value>) -> Result<String, String> {
+        let endpoint = args.get("endpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: endpoint".to_string())?;
+
+        let session_id = self.authenticate().await?;
+
+        #[derive(Serialize)]
+        struct RegisterRequest { endpoint: String }
+
+        let resp = self.client
+            .post(format!("{}/register", self.registry_url))
+            .header("Authorization", format!("Bearer {}", session_id))
+            .json(&RegisterRequest { endpoint: endpoint.to_string() })
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send register: {}", e))?;
+
+        if !resp.status().is_success() {
+            let error: ErrorResponse = resp.json().await
+                .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
+            return Err(error.error);
+        }
+
+        Ok(format!("✓ Registered {} at endpoint: {}", self.key.did(), endpoint))
+    }
+
+    async fn handle_lookup(&self, args: serde_json::Map<String, serde_json::Value>) -> Result<String, String> {
+        let did = args.get("did")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: did".to_string())?;
+
+        let encoded_did = urlencoding::encode(did);
+        let resp = self.client
+            .get(format!("{}/lookup/{}", self.registry_url, encoded_did))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to lookup: {}", e))?;
+
+        if resp.status().as_u16() == 404 {
+            return Err("Agent not found in registry".to_string());
+        }
+
+        if !resp.status().is_success() {
+            let error: ErrorResponse = resp.json().await
+                .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
+            return Err(error.error);
+        }
+
+        let lookup: LookupResponse = resp.json().await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(format!("✓ Found {}\n  Endpoint: {}", lookup.did, lookup.endpoint))
+    }
+
+    async fn handle_deregister(&self) -> Result<String, String> {
+        let session_id = self.authenticate().await?;
+
+        let resp = self.client
+            .delete(format!("{}/deregister", self.registry_url))
+            .header("Authorization", format!("Bearer {}", session_id))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to deregister: {}", e))?;
+
+        if !resp.status().is_success() {
+            let error: ErrorResponse = resp.json().await
+                .unwrap_or(ErrorResponse { error: "Unknown error".to_string() });
+            return Err(error.error);
+        }
+
+        *self.session.write().await = None;
+
+        Ok(format!("✓ Deregistered {}", self.key.did()))
+    }
+
+    async fn handle_status(&self) -> Result<String, String> {
+        let did = self.key.did().to_string();
+        let encoded_did = urlencoding::encode(&did);
+
+        let resp = self.client
+            .get(format!("{}/lookup/{}", self.registry_url, encoded_did))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to check status: {}", e))?;
+
+        if resp.status().as_u16() == 404 {
+            return Ok(format!("○ Not registered\n  DID: {}", did));
+        }
+
+        if resp.status().is_success() {
+            let lookup: LookupResponse = resp.json().await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+            return Ok(format!("✓ Registered\n  DID: {}\n  Endpoint: {}", lookup.did, lookup.endpoint));
+        }
+
+        Err("Failed to check status".to_string())
+    }
+
+    async fn handle_whoami(&self) -> Result<String, String> {
+        Ok(format!("Your DID: {}", self.key.did()))
+    }
+}
+
+impl ServerHandler for ReachMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: Default::default(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability {
+                    list_changed: Some(false),
+                }),
+                ..Default::default()
+            },
+            server_info: Implementation {
+                name: "agent-reach-mcp".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            instructions: Some("Agent discovery registry MCP server".to_string()),
+        }
+    }
+
+    fn list_tools(
+        &self,
+        _params: PaginatedRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        async move {
+            let tools = vec![
+                Tool {
+                    name: "reach_register".into(),
+                    description: "Register your endpoint in the discovery registry".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "endpoint": {"type": "string", "description": "Endpoint URL"}
+                        },
+                        "required": ["endpoint"]
+                    }).as_object().cloned().unwrap().into(),
+                },
+                Tool {
+                    name: "reach_lookup".into(),
+                    description: "Look up an agent's endpoint by DID".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "did": {"type": "string", "description": "DID to look up"}
+                        },
+                        "required": ["did"]
+                    }).as_object().cloned().unwrap().into(),
+                },
+                Tool {
+                    name: "reach_deregister".into(),
+                    description: "Remove your registration".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }).as_object().cloned().unwrap().into(),
+                },
+                Tool {
+                    name: "reach_status".into(),
+                    description: "Check your registration status".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }).as_object().cloned().unwrap().into(),
+                },
+                Tool {
+                    name: "reach_whoami".into(),
+                    description: "Show your DID".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }).as_object().cloned().unwrap().into(),
+                },
+            ];
+            Ok(ListToolsResult { tools, next_cursor: None })
+        }
+    }
+
+    fn call_tool(
+        &self,
+        params: CallToolRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        let this = self.clone();
+        async move {
+            let args = params.arguments.unwrap_or_default();
+
+            let result = match params.name.as_ref() {
+                "reach_register" => this.handle_register(args).await,
+                "reach_lookup" => this.handle_lookup(args).await,
+                "reach_deregister" => this.handle_deregister().await,
+                "reach_status" => this.handle_status().await,
+                "reach_whoami" => this.handle_whoami().await,
+                _ => Err(format!("Unknown tool: {}", params.name)),
+            };
+
+            match result {
+                Ok(text) => Ok(CallToolResult {
+                    content: vec![Content::text(text)],
+                    is_error: Some(false),
+                }),
+                Err(e) => Ok(CallToolResult {
+                    content: vec![Content::text(e)],
+                    is_error: Some(true),
+                }),
+            }
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
 
     info!("Starting agent-reach-mcp...");
 
-    // Load identity
     let key = load_identity().context(
-        "Failed to load identity. Run agent-id-mcp and use 'generate_identity' first."
+        "Failed to load identity. Run agent-id-mcp and use 'identity_generate' first."
     )?;
-    
+
     info!(did = %key.did(), "Loaded identity");
 
-    // Create server
-    let server = Arc::new(ReachMcpServer::new(key));
-    let handler = ReachMcpHandler { server: server.clone() };
-
-    // Register tools and run
-    let service = handler
-        .serve(reach_register)
-        .serve(reach_lookup)
-        .serve(reach_deregister)
-        .serve(reach_status)
-        .serve(reach_whoami);
+    let server = ReachMcpServer::new(key);
 
     info!("MCP server ready");
 
-    // Run on stdio
-    let transport = stdio::StdioTransport::new();
-    rmcp::serve(service, transport).await?;
+    let transport = stdio();
+    let running = server.serve(transport).await?;
+    running.waiting().await?;
 
     Ok(())
 }
