@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "server",
     "cli",
+    "mcp",
 ]
 
 [workspace.package]

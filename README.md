@@ -42,6 +42,7 @@ cargo run -p agent-reach-cli -- lookup http://localhost:3001 did:key:z6Mk...
 agent-reach/
   server/     # Registry server (agent-reach-server)
   cli/        # CLI client (agent-reach)
+  mcp/        # MCP server for agents (agent-reach-mcp)
 ```
 
 ### Server
@@ -126,6 +127,29 @@ This proves the agent controls the DID's private key before allowing registratio
 │          agent-id               │  ← who agents are
 └─────────────────────────────────┘
 ```
+
+### MCP Server
+
+For AI agents, the MCP server provides safe, high-level tools that handle all authentication automatically:
+
+```bash
+# Run the MCP server (stdio transport)
+cargo run -p agent-reach-mcp
+```
+
+**Tools:**
+
+| Tool | Description |
+|------|-------------|
+| `reach_register` | Register your endpoint in the registry |
+| `reach_lookup` | Find another agent by DID |
+| `reach_deregister` | Remove your registration |
+| `reach_status` | Check your registration status |
+| `reach_whoami` | Show your DID |
+
+The MCP server handles the full handshake authentication internally — agents just call `reach_register(endpoint)` and it works.
+
+See [mcp/README.md](mcp/README.md) for details.
 
 ## Related Projects
 
