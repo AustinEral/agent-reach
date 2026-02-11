@@ -101,17 +101,32 @@ pub async fn deregister(
 }
 
 /// Verify a signature using agent-id
-fn verify_signature(did: &str, message: &str, signature_b64: &str) -> Result<(), ReachError> {
+fn verify_signature(did_str: &str, message: &str, signature_b64: &str) -> Result<(), ReachError> {
+    use agent_id::Did;
+    use ed25519_dalek::Signature;
+    use std::str::FromStr;
+
+    // Parse DID
+    let did = Did::from_str(did_str).map_err(|_| ReachError::InvalidDid)?;
+    
+    // Get public key from DID
+    let public_key = did.public_key().map_err(|_| ReachError::InvalidDid)?;
+
     // Decode signature from base64
-    let signature = base64::Engine::decode(
+    let sig_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         signature_b64,
     )
     .map_err(|_| ReachError::InvalidSignature)?;
 
-    // Use agent-id to verify
-    // For now, we'll use the agent_id crate's verification
-    agent_id::did::verify_signature(did, message.as_bytes(), &signature)
+    // Parse signature (must be exactly 64 bytes)
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| ReachError::InvalidSignature)?;
+    let signature = Signature::from_bytes(&sig_array);
+
+    // Verify using agent-id
+    agent_id::core::keys::verify(&public_key, message.as_bytes(), &signature)
         .map_err(|_| ReachError::InvalidSignature)?;
 
     Ok(())
